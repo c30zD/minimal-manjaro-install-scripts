@@ -24,11 +24,11 @@ if [ "${PARTITIONING}" == "y" ]; then
     # partition the block device with cfdisk
     cfdisk "${BLOCK_DEVICE}"
 else
-    # make a 550 MB EFI partition along with a 170GB LUKS partition, leave the rest of the space unallocated
-    sgdisk --clear -n 1:0:+550M -t 1:ef00 -n 2:0:+170G -t 2:8e00 "${BLOCK_DEVICE}"
+    # make a 550 MiB EFI partition and use the rest of the disk for LUKS partition
+    sgdisk --clear -n 1:0:+550M -t 1:ef00 -n 2:0:0 -t 2:8309 "${BLOCK_DEVICE}"
 
     # format EFI partition
-    mkfs.fat -F32 "${BLOCK_DEVICE}p1"
+    mkfs.fat -F32 -n ESP "${BLOCK_DEVICE}1"
 fi
 
 # show partitions
@@ -43,7 +43,7 @@ echo -n "Enter the LUKS partition path: "
 read -r NEW_PARTITION
 
 # create a LUKS partiton
-cryptsetup luksFormat "${NEW_PARTITION}"
+cryptsetup luksFormat -y -v -s 512 --pbkdf argon2id --pbkdf-force-iterations 22 "${NEW_PARTITION}"
 
 # open the LUKS partition
 cryptsetup open "${NEW_PARTITION}" cryptlvm
@@ -54,38 +54,43 @@ pvcreate /dev/mapper/cryptlvm
 # create logical volume group on the physical volume
 vgcreate vg1 /dev/mapper/cryptlvm
 
-# create logical volume named root on the volume group with 40 GB of space
-lvcreate -L 40G vg1 -n root
+# create logical volumes named root<num> on the volume group with 80 GB of space
+lvcreate -L 80G vg1 -n root1
+lvcreate -L 80G vg1 -n root2
+lvcreate -L 80G vg1 -n root3
 
 # create logical volume named home on the volume group with the rest of the space
-lvcreate -l 100%FREE vg1 -n home
+lvcreate -l 100%FREE vg1 -n data
 
-# format root lv partition with ext4 filesystem
-mkfs.ext4 -m 1 /dev/vg1/root
+# format root LV partition with ext4 filesystem
+mkfs.ext4 -m 1 -L Manjaro /dev/vg1/root1
 
 # format home lv partition with ext4 filesystem
-mkfs.ext4 -m 1 /dev/vg1/home
+mkfs.ext4 -m 1 -L DATA /dev/vg1/data
+
+# Set the number of reserved block space to 10 GiB (this assumes a very large disk size) and a blocksize of 4096 bytes
+tune2fs -r $((10 * 1024**3 / 4096)) /dev/vg1/data
 
 # mount the root partition
-mount /dev/vg1/root /mnt
+mount /dev/vg1/root1 /mnt
 
 # create home directory
-mkdir -p /mnt/home
+#mkdir -p /mnt/home
 
 # mount the home partition
-mount /dev/vg1/home /mnt/home
+#mount /dev/vg1/home /mnt/home
 
 # create boot directory
-mkdir -p /mnt/boot
+mkdir -p /mnt/boot/efi
 
 # mount the EFI partiton
-mount "${BOOT_PARTITION}" /mnt/boot
+mount "${BOOT_PARTITION}" /mnt/boot/efi
 
 # show the mounted partitions
 lsblk
 
 # install necessary packages
-pacstrap -K /mnt base base-devel linux linux-headers linux-lts linux-lts-headers linux-firmware lvm2 vim git networkmanager refind os-prober efibootmgr iwd intel-ucode
+basestrap /mnt base base-devel linux linux-lts linux-firmware lvm2 vim git networkmanager refind os-prober efibootmgr exfatprogs dosfstools f2fs-tools mhwd man-db texinfo
 
 # refind-install hook
 cat <<EOF >/etc/pacman.d/hooks/refind.hook
@@ -101,33 +106,33 @@ Exec=/usr/bin/refind-install
 EOF
 
 # Generate an fstab config
-genfstab -U /mnt >>/mnt/etc/fstab
+fstabgen -U /mnt >>/mnt/etc/fstab
 
 # copy chroot-script.sh to /mnt
 cp chroot-script.sh /mnt
 
 # chroot into the new system and run the chroot-script.sh script
-arch-chroot /mnt ./chroot-script.sh
+manjaro-chroot /mnt ./chroot-script.sh
 
 # get the UUID of the LUKS partition
 LUKS_UUID=$(blkid -s UUID -o value "${NEW_PARTITION}")
 
 # prepare boot options for refind
-BLK_OPTIONS="cryptdevice=UUID=${LUKS_UUID}:cryptlvm root=/dev/vg1/root"
+BLK_OPTIONS="cryptdevice=UUID=${LUKS_UUID}:cryptlvm root=/dev/vg1/root1"
 RW_LOGLEVEL_OPTIONS="rw loglevel=3"
-INITRD_OPTIONS="initrd=intel-ucode.img initrd=initramfs-%v.img"
+INITRD_OPTIONS="initrd=initramfs-%v.img"
 # configure refind
 cat <<EOF >/mnt/boot/refind_linux.conf
 "Boot with standard options"     "${BLK_OPTIONS} ${RW_LOGLEVEL_OPTIONS} ${INITRD_OPTIONS}"
-"Boot using fallback initramfs"  "${BLK_OPTIONS} ${RW_LOGLEVEL_OPTIONS} initrd=intel-ucode.img initrd=initramfs-%v-fallback.img"
+"Boot using fallback initramfs"  "${BLK_OPTIONS} ${RW_LOGLEVEL_OPTIONS} initrd=initramfs-%v-fallback.img"
 "Boot to terminal"               "${BLK_OPTIONS} ${RW_LOGLEVEL_OPTIONS} ${INITRD_OPTIONS} systemd.unit=multi-user.target"
 "Boot to single-user mode"       "${BLK_OPTIONS} ${RW_LOGLEVEL_OPTIONS} ${INITRD_OPTIONS} single"
 "Boot with minimal options"      "${BLK_OPTIONS} ${INITRD_OPTIONS} ro"
 EOF
-sed -i 's|#extra_kernel_version_strings|extra_kernel_version_strings|' /mnt/boot/EFI/refind/refind.conf
-sudo sed -i 's|#fold_linux_kernels|fold_linux_kernels|' /mnt/boot/EFI/refind/refind.conf
+sed -i 's|#extra_kernel_version_strings|extra_kernel_version_strings|' /mnt/boot/efi/EFI/refind/refind.conf
+sudo sed -i 's|#fold_linux_kernels|fold_linux_kernels|' /mnt/boot/efi/EFI/refind/refind.conf
 
 # unmount partitions
-umount /mnt/home 
-umount /mnt/boot 
+#umount /mnt/home 
+umount /mnt/boot/efi
 umount /mnt
